@@ -31,6 +31,7 @@ import android.util.Log
 import com.meshchat.core.Channel as MeshChannel
 import com.meshchat.core.DiscoveryMode
 import com.meshchat.core.Fragmenter
+import com.meshchat.core.MeshLog
 import com.meshchat.core.MeshPacket
 import com.meshchat.core.MeshTransport
 import com.meshchat.core.NodeIds
@@ -87,8 +88,14 @@ class BleTransport(
     private val adapter: BluetoothAdapter? = manager.adapter
     private val main = Handler(Looper.getMainLooper())
 
-    private val _events = MutableSharedFlow<TransportEvent>(extraBufferCapacity = 1024)
+    private val _events = MutableSharedFlow<TransportEvent>(extraBufferCapacity = 4096)
     override val events: SharedFlow<TransportEvent> = _events.asSharedFlow()
+
+    private fun emit(e: TransportEvent) {
+        if (!_events.tryEmit(e)) MeshLog.log("ble: event buffer full, dropped ${e::class.simpleName}")
+    }
+
+    private fun blog(msg: String) = MeshLog.log("ble: $msg")
 
     private val _status = MutableStateFlow(TransportStatus())
     override val status: StateFlow<TransportStatus> = _status.asStateFlow()
@@ -165,6 +172,7 @@ class BleTransport(
         // Tie-break: the lower Node ID initiates. The higher one only steps in after a grace period.
         if (myId > peerId && now - first < HIGHER_ID_DELAY_MS) return
         if (!connecting.add(peerId)) return
+        blog("connecting to ${peerId.take(8)} (attempt after ${failCount[peerId] ?: 0} failures)")
         scope.launch {
             try {
                 connectMutex.withLock {          // Android handles one outgoing connection attempt at a time most reliably
@@ -201,8 +209,19 @@ class BleTransport(
         scanJob = scope.launch { modeFlow.collectLatest { runScanProfile(it) } }
         advertiseWatchJob = scope.launch {
             while (true) {
-                delay(20_000)
-                if (radioOn && !_status.value.advertising) startAdvertising(false)
+                delay(15_000)
+                if (radioOn && !_status.value.advertising) {
+                    blog("advertiser was not running, restarting")
+                    startAdvertising(false)
+                }
+                // Link watchdog: HELLOs flow every <= 20 s in both directions, so a long silence means a dead link.
+                val now = SystemClock.elapsedRealtime()
+                for (l in links.values.toList()) {
+                    if (now - l.lastRx > RX_SILENCE_MS) {
+                        blog("link ${l.peerId.take(8)} silent for ${(now - l.lastRx) / 1000}s, dropping it")
+                        l.close()
+                    }
+                }
             }
         }
     }
@@ -254,11 +273,13 @@ class BleTransport(
 
         val cb = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+                blog("advertising started (${if (useScanResponse) "scan-response" else "primary"} data)")
                 _status.update { it.copy(advertising = true) }
             }
 
             override fun onStartFailure(errorCode: Int) {
                 Log.w(TAG, "advertise failed: $errorCode")
+                blog("advertising FAILED code=$errorCode")
                 _status.update { it.copy(advertising = false, error = "advertise error $errorCode") }
                 if (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE && !useScanResponse) {
                     main.post { if (radioOn) startAdvertising(true) }   // fallback: manufacturer data in scan response
@@ -292,6 +313,7 @@ class BleTransport(
         override fun onBatchScanResults(results: MutableList<ScanResult>) = results.forEach(::handleScan)
         override fun onScanFailed(errorCode: Int) {
             scanActive = false
+            blog("scan FAILED code=$errorCode")
             _status.update { it.copy(scanning = false, error = "scan failed $errorCode") }
         }
     }
@@ -300,9 +322,9 @@ class BleTransport(
         val rec = r.scanRecord ?: return
         val (caps, id) = Protocol.decodeAdvert(rec.getManufacturerSpecificData(Protocol.COMPANY_ID)) ?: return
         if (id == myId || !NodeIds.isValid(id)) return
-        addressByPeer[id] = r.device.address
+        if (addressByPeer.put(id, r.device.address) == null) blog("scan: found ${id.take(8)} rssi=${r.rssi}")
         firstSeen.putIfAbsent(id, SystemClock.elapsedRealtime())
-        _events.tryEmit(TransportEvent.PeerSeen(id, r.rssi, caps))
+        emit(TransportEvent.PeerSeen(id, r.rssi, caps))
     }
 
     /**
@@ -387,19 +409,21 @@ class BleTransport(
             if (links.size >= MAX_LINKS) return false
             links[link.peerId] = link
         }
+        blog("link UP ${link.peerId.take(8)} (${if (link.weInitiated) "we connected" else "they connected"}) links=${links.size}")
         failUntil.remove(link.peerId)
         failCount.remove(link.peerId)
         firstSeen.remove(link.peerId)
         _status.update { it.copy(links = links.size) }
-        _events.tryEmit(TransportEvent.LinkUp(link.peerId, link.weInitiated))
+        emit(TransportEvent.LinkUp(link.peerId, link.weInitiated))
         return true
     }
 
     @Synchronized
     private fun unregisterLink(link: BleLink) {
         if (links.remove(link.peerId, link)) {
+            blog("link DOWN ${link.peerId.take(8)}")
             _status.update { it.copy(links = links.size) }
-            _events.tryEmit(TransportEvent.LinkDown(link.peerId))
+            emit(TransportEvent.LinkDown(link.peerId))
         }
     }
 
@@ -419,11 +443,35 @@ class BleTransport(
         protected abstract suspend fun writeFrame(channel: MeshChannel, frame: ByteArray): Boolean
         abstract fun close()
 
-        /** Whole packets are serialized per link so fragments of different packets never interleave. */
-        suspend fun send(channel: MeshChannel, data: ByteArray): Boolean = sendMutex.withLock {
-            val frames = fragmenter.split(data, maxFrame)
-            for (f in frames) if (!writeFrame(channel, f)) return@withLock false
-            true
+        @Volatile var lastRx: Long = SystemClock.elapsedRealtime()
+        @Volatile private var failedSends = 0
+        fun touchRx() {
+            lastRx = SystemClock.elapsedRealtime()
+        }
+
+        /**
+         * Whole packets are serialized per link so fragments of different packets never interleave.
+         * A link whose writes keep failing is a zombie (the OS still says "connected" but nothing gets through):
+         * after [MAX_FAILED_SENDS] consecutive failed packets it is torn down so that a fresh connection is made.
+         */
+        suspend fun send(channel: MeshChannel, data: ByteArray): Boolean {
+            val ok = sendMutex.withLock {
+                val frames = fragmenter.split(data, maxFrame)
+                var good = true
+                for (f in frames) if (!writeFrame(channel, f)) {
+                    good = false
+                    break
+                }
+                good
+            }
+            if (ok) {
+                failedSends = 0
+            } else if (++failedSends >= MAX_FAILED_SENDS) {
+                blog("link ${peerId.take(8)} dropped: $failedSends consecutive write failures")
+                failedSends = 0
+                close()
+            }
+            return ok
         }
     }
 
@@ -438,6 +486,7 @@ class BleTransport(
         val link = ClientLink(peerId, device)
         val ok = link.connect()
         if (!ok) {
+            blog("connect to ${peerId.take(8)} FAILED")
             link.close()
             val n = (failCount[peerId] ?: 0) + 1
             failCount[peerId] = n
@@ -486,6 +535,7 @@ class BleTransport(
 
         private fun fail(why: String) {
             Log.w(TAG, "client link to $peerId failed: $why")
+            blog("client link ${peerId.take(8)} setup failed: $why")
             close()
         }
 
@@ -533,6 +583,7 @@ class BleTransport(
         @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
         private val callback = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+                blog("gatt client state peer=${peerId.take(8)} status=$status newState=$newState")
                 if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
                     gatt = g
                     // A short pause before the MTU request avoids a known race on several vendors' stacks.
@@ -545,6 +596,7 @@ class BleTransport(
             }
 
             override fun onMtuChanged(g: BluetoothGatt, newMtu: Int, status: Int) {
+                blog("mtu=$newMtu status=$status")
                 if (status == BluetoothGatt.GATT_SUCCESS) mtu = newMtu
                 if (!g.discoverServices()) fail("discoverServices")
             }
@@ -585,7 +637,7 @@ class BleTransport(
                 val frame = ch.value ?: return
                 val channel = channelOf(ch.uuid) ?: return
                 val packet = reassemblers.getValue(channel).accept(frame) ?: return
-                _events.tryEmit(TransportEvent.Frame(peerId, channel, packet))
+                touchRx(); emit(TransportEvent.Frame(peerId, channel, packet))
             }
         }
     }
@@ -689,6 +741,7 @@ class BleTransport(
         }
 
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            blog("gatt server state status=$status newState=$newState")
             if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 val s = sessions.remove(device.address) ?: return
                 s.link?.let { unregisterLink(it) }
@@ -770,7 +823,7 @@ class BleTransport(
                 return
             }
         }
-        _events.tryEmit(TransportEvent.Frame(link.peerId, channel, data))
+        link.touchRx(); emit(TransportEvent.Frame(link.peerId, channel, data))
     }
 
     private companion object {
@@ -780,5 +833,7 @@ class BleTransport(
         const val CONNECT_TIMEOUT_MS = 20_000L
         const val WRITE_TIMEOUT_MS = 5_000L
         const val HIGHER_ID_DELAY_MS = 12_000L
+        const val MAX_FAILED_SENDS = 2
+        const val RX_SILENCE_MS = 75_000L      // peers send HELLO at least every 20 s
     }
 }

@@ -129,6 +129,13 @@ Home (Announce/Nearby/Chats কার্ড, "● Mesh: N nodes"), Nearby (hops,
 
 ---
 
+## Troubleshooting: "waiting" থেকে যায় / link ওঠে না
+
+1. দুই ফোনেই **Me ▸ Debug** খুলুন। `GATT links` ≥ 1 না হলে বার্তা যাবে না — ⏳ waiting মানে "সংরক্ষিত, link নেই"।
+2. Debug-এর নিচে **Link log**: `scan: found …` (প্রতিবেশী দেখা গেছে), `connecting …`, `gatt client state … status=…` (status 133/8 = Android BLE ত্রুটি), `link UP/DOWN`, `media … send start / write FAILED / INTERRUPTED`, `link … dropped: …`। **Copy full link log** চাপে দুই ফোনের log পাঠান।
+3. PC থাকলে: `adb logcat -s MeshBle:I` (বার্তার লেখা/key কিছু log হয় না, শুধু Node ID-র ৮ অক্ষর ও অবস্থা)।
+4. দুই ফোনে Bluetooth ON, Nearby devices permission, Battery "Unrestricted" (Samsung: Sleeping apps থেকে বাদ) নিশ্চিত করুন; অ্যাপ foreground-এ রাখুন।
+
 ## Android-এর বাস্তব সীমাবদ্ধতা (fake করা হয়নি)
 
 * **Background execution**: Foreground Service ছাড়া Android 8+ কয়েক মিনিটে process থামায়। আমরা `connectedDevice` FGS চালাই (notification দেখা যায়)। Android 12+-এ FGS **শুধু visible Activity থেকে** শুরু করা যায় — তাই রিবুটের পর অ্যাপ একবার খুলতে হয় (auto-start-on-boot নেই)।

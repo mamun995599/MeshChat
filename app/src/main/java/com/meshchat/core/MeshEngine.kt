@@ -128,6 +128,7 @@ class MeshEngine(
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean = size > 500
     }
     private val lastReAck = HashMap<String, Long>()                        // guarded by itself
+    private val loggedPeers = HashSet<String>()                            // log "first seen" once per peer (event loop only)
     private val mediaMutex = Mutex()                                       // one media send at a time: BLE bandwidth is tiny
     private val mediaInFlight: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
@@ -329,11 +330,13 @@ class MeshEngine(
             when (ev) {
                 is TransportEvent.PeerSeen -> {
                     if (ev.peerId == myId || ev.peerId in blocked) return
+                    if (loggedPeers.add(ev.peerId)) MeshLog.log("peer ${ev.peerId.take(8)} first seen rssi=${ev.rssi}")
                     neighborTable.seen(ev.peerId, ev.rssi, ev.caps, clock())
                     if (ev.peerId !in transport.linkedPeers()) transport.connectTo(ev.peerId)
                 }
                 is TransportEvent.LinkUp -> onLinkUp(ev.peerId)
                 is TransportEvent.LinkDown -> {
+                    MeshLog.log("engine: link DOWN ${ev.peerId.take(8)}")
                     neighborTable.setLinked(ev.peerId, false, clock())
                     routingTable.removeVia(ev.peerId)
                     publish()
@@ -348,6 +351,7 @@ class MeshEngine(
     }
 
     private fun onLinkUp(peer: String) {
+        MeshLog.log("engine: link UP ${peer.take(8)}")
         val now = clock()
         neighborTable.setLinked(peer, true, now)
         routingTable.update(peer, peer, 1, now)
@@ -647,6 +651,7 @@ class MeshEngine(
         val out = ByteArrayOutputStream()
         for (c in t.chunks) out.write(c!!)
         val idBytes = Hex.decode(idHex)
+        MeshLog.log("media ${idHex.take(6)} all ${t.total} chunks received from ${src.take(8)}")
         val plain = CryptoService.decrypt(identity, senderKey, src, CryptoService.aad(src, myId, idBytes), out.toByteArray())
         if (plain == null) {
             drop("media: decrypt failed")      // corrupt or forged: no ACK, the sender will retry the whole transfer
@@ -700,6 +705,7 @@ class MeshEngine(
             }
         }
         for (n in list) {
+            MeshLog.log("media ${n.idHex.take(6)} stalled, NACK ${n.missing.size} missing chunks to ${n.src.take(8)}")
             val pkt = newPacket(PacketType.MEDIA_NACK, n.src, MediaPayloads.encodeNack(Hex.decode(n.idHex), n.missing), Protocol.MAX_HOPS, sign = false)
             dup.checkAndAdd(pkt.key)
             routeOrQueue(pkt, from = null, queue = false)
@@ -762,6 +768,7 @@ class MeshEngine(
     /** Sends all chunks (or only [only], after a NACK) toward the next hop. Back-pressure comes from transport.send. */
     private suspend fun sendTransfer(info: OutTransferInfo, only: List<Int>?) {
         val blob = store.getOutBlob(info.idHex) ?: return
+        MeshLog.log("media ${info.idHex.take(6)} send start to ${info.dst.take(8)} chunks=${only?.size ?: info.total}/${info.total} attempt=${info.attempts}")
         val idBytes = Hex.decode(info.idHex)
         val indices = only?.filter { it in 0 until info.total }?.distinct() ?: (0 until info.total).toList()
         var complete = true
@@ -779,12 +786,14 @@ class MeshEngine(
             val pkt = MeshPacket(PacketType.MEDIA, 0, Protocol.MAX_HOPS, 0, newMsgId(), myId, info.dst, now, payload)
             dup.checkAndAdd(pkt.key)
             if (!transport.send(route.nextHop, pkt.type.channel, pkt.encode())) {
+                MeshLog.log("media ${info.idHex.take(6)} chunk $i/${info.total} write FAILED via ${route.nextHop.take(8)}")
                 complete = false
                 break
             }
             if (n % 4 == 0) setProgress(info.idHex, (n + 1).toFloat() / indices.size)
         }
         setProgress(info.idHex, null)
+        MeshLog.log("media ${info.idHex.take(6)} send ${if (complete) "done (waiting for ACK)" else "INTERRUPTED, will retry"}")
         val now = clock()
         if (only == null && complete) {
             store.updateOutTransfer(info.idHex, info.attempts + 1, now)
@@ -941,6 +950,7 @@ class MeshEngine(
     }
 
     private fun drop(reason: String) {
+        MeshLog.log("drop: $reason")
         _stats.update { it.copy(dropped = it.dropped + 1, lastDrop = reason) }
     }
 }

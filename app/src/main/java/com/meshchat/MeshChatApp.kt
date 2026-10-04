@@ -1,6 +1,8 @@
 package com.meshchat
 
 import android.app.Application
+import android.util.Log
+import com.meshchat.core.MeshLog
 import com.meshchat.repo.MeshRepository
 import com.meshchat.service.Notifier
 
@@ -10,6 +12,7 @@ class MeshChatApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        MeshLog.sink = { Log.i("MeshBle", it) }   // adb logcat -s MeshBle
         Notifier.createChannels(this)
         repo = MeshRepository(this)
     }

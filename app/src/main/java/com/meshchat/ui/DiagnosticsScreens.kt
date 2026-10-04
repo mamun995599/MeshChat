@@ -30,6 +30,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+import com.meshchat.core.MeshLog
 import com.meshchat.core.NodeIds
 import kotlin.math.PI
 import kotlin.math.cos
@@ -47,6 +50,8 @@ fun DebugScreen(vm: MainViewModel, myNodeId: String, modifier: Modifier = Modifi
     val pending by vm.pendingCount.collectAsState()
     val now by rememberNow()
     val mono = FontFamily.Monospace
+    val logLines by MeshLog.lines.collectAsState()
+    val clipboard = LocalClipboardManager.current
 
     Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         DebugCard("BLE Status") {
@@ -82,6 +87,14 @@ fun DebugScreen(vm: MainViewModel, myNodeId: String, modifier: Modifier = Modifi
             Mono("Pending (store-and-forward): $pending")
         }
         Button(onClick = vm::syncNow, modifier = Modifier.fillMaxWidth()) { Text("Re-announce identity & sync now") }
+        DebugCard("Link log (newest last; no message content)") {
+            if (logLines.isEmpty()) Mono("—")
+            else logLines.takeLast(40).forEach { Mono(it) }
+        }
+        Button(
+            onClick = { clipboard.setText(AnnotatedString(logLines.joinToString("\n"))) },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Copy full link log") }
     }
 }
 
