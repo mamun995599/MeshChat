@@ -422,6 +422,9 @@ class BleTransport(
     private fun unregisterLink(link: BleLink) {
         if (links.remove(link.peerId, link)) {
             blog("link DOWN ${link.peerId.take(8)}")
+            // The higher-ID phone must wait again before dialling out, otherwise both phones reconnect at the same moment
+            // and the duplicate-link tie-break tears the new link down again.
+            firstSeen[link.peerId] = SystemClock.elapsedRealtime()
             _status.update { it.copy(links = links.size) }
             emit(TransportEvent.LinkDown(link.peerId))
         }
@@ -456,7 +459,9 @@ class BleTransport(
          */
         suspend fun send(channel: MeshChannel, data: ByteArray): Boolean {
             val ok = sendMutex.withLock {
-                val frames = fragmenter.split(data, maxFrame)
+                // Never exceed FRAME_CAP: Android 14+ negotiates MTU 517 on its own, but one attribute value is at most
+                // 512 bytes, so a 514-byte write fails. Small packets (text) fit in one frame and hid this bug.
+                val frames = fragmenter.split(data, minOf(maxFrame, FRAME_CAP))
                 var good = true
                 for (f in frames) if (!writeFrame(channel, f)) {
                     good = false
@@ -485,7 +490,10 @@ class BleTransport(
         } ?: return
         val link = ClientLink(peerId, device)
         val ok = link.connect()
-        if (!ok) {
+        if (!ok && links.containsKey(peerId)) {
+            blog("connect to ${peerId.take(8)} not needed: they already connected to us")
+            link.close()
+        } else if (!ok) {
             blog("connect to ${peerId.take(8)} FAILED")
             link.close()
             val n = (failCount[peerId] ?: 0) + 1
@@ -574,6 +582,7 @@ class BleTransport(
             ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT   // with response = link-level ack
             ch.value = frame
             if (!g.writeCharacteristic(ch)) {
+                blog("writeCharacteristic refused (busy/invalid) len=${frame.size}")
                 pendingWrite = null
                 return false
             }
@@ -596,7 +605,7 @@ class BleTransport(
             }
 
             override fun onMtuChanged(g: BluetoothGatt, newMtu: Int, status: Int) {
-                blog("mtu=$newMtu status=$status")
+                blog("mtu=$newMtu status=$status (frames capped at $FRAME_CAP)")
                 if (status == BluetoothGatt.GATT_SUCCESS) mtu = newMtu
                 if (!g.discoverServices()) fail("discoverServices")
             }
@@ -630,6 +639,7 @@ class BleTransport(
             }
 
             override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
+                if (status != BluetoothGatt.GATT_SUCCESS) blog("write to ${peerId.take(8)} failed status=$status")
                 pendingWrite?.complete(status == BluetoothGatt.GATT_SUCCESS)
             }
 
@@ -794,6 +804,7 @@ class BleTransport(
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) blog("notify failed status=$status")
             notifyDeferred?.complete(status == BluetoothGatt.GATT_SUCCESS)
         }
 
@@ -834,6 +845,7 @@ class BleTransport(
         const val WRITE_TIMEOUT_MS = 5_000L
         const val HIGHER_ID_DELAY_MS = 12_000L
         const val MAX_FAILED_SENDS = 2
+        const val FRAME_CAP = 244              // bytes per GATT write/notify, incl. 4-byte fragment header
         const val RX_SILENCE_MS = 75_000L      // peers send HELLO at least every 20 s
     }
 }
